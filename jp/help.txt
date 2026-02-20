@@ -1,14 +1,70 @@
-Usage
-- olm --help
-- olm --help jp
-- olm --help en
-- olm --logs
+# olm help jp
+- 目的
+- コマンドの実行結果を記録し必要に応じてLLMで短く解説する
+- 失敗時は原因と確認コマンドを優先して提示する
+- 危険コマンドや秘密情報っぽいものはデフォルトで履歴に残さない
+
+# 基本
+- olm "command"
+- 引数はシェルで評価されるのでダブルクォート推奨
+- 例
+- olm "ls -la"
+- olm "journalctl -u ssh -n 200"
+
+# 主要オプション
+- -e
+- 成功時はLLMを呼ばない 失敗したときだけLLM解説を出す
+- 例
+- olm -e "ls /nope"
+- --no-llm
+- LLMを使わず実行結果だけ出す
+- 例
+- olm --no-llm "pwd"
+- -p "追加指示"
+- LLMへの追加指示を足す
+- 例
+- olm -p "結論から 3行で" "git status"
+- -d
+- 成功時でも重めモデル寄りで解説する
+- 例
+- olm -d "docker ps"
+
+# stdin モード
+- --analyze
+- stdin を実行せずに要約 診断する
+- 例
+- cat error.log | olm --analyze
+- --exec-stdin --yes
+- stdin の各行をコマンドとして順番に実行する 危険
+- --yes が必須
+- 例
+- printf "%s\n" "pwd" "ls -la" | olm --exec-stdin --yes
+
+# 設定
+- 設定ファイル
+- ~/.config/olm/config.env
+- 一覧
 - olm config list
+- 取得
 - olm config get KEY
+- 設定
 - olm config set KEY VALUE
+- 例
+- olm config set OLM_LANG jp
+
+# 履歴とログ
+- ログ表示
+- olm --logs
+- 履歴表示
 - olm history --last N
+- キーワード検索
 - olm history --grep WORD
-- olm -e "command"
-- olm --no-llm "command"
-- olm --analyze
-- olm --exec-stdin --yes
+
+# 代表的な設定キー
+- OLM_MODEL_STD
+- OLM_MODEL_LGT
+- OLM_MODEL_HVY
+- OLM_MODEL_FA
+- OLM_MODEL_FB
+- OLM_LANG
+- OLM_ALWAYS_PROMPT

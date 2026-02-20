@@ -1,14 +1,68 @@
-Usage
-- olm --help
-- olm --help jp
-- olm --help en
-- olm --logs
+# olm help en
+- purpose
+- run commands and optionally explain output with LLM
+- on failure prefer root cause and safe check commands
+- do not log dangerous commands or possible secrets by default
+
+# basic
+- olm "command"
+- quote command with double quotes
+- example
+- olm "ls -la"
+- olm "journalctl -u ssh -n 200"
+
+# options
+- -e
+- call LLM only when command failed
+- example
+- olm -e "ls /nope"
+- --no-llm
+- run command without LLM
+- example
+- olm --no-llm "pwd"
+- -p "extra instruction"
+- add instruction to LLM
+- example
+- olm -p "3 lines" "git status"
+- -d
+- use heavier model for success path
+- example
+- olm -d "docker ps"
+
+# stdin modes
+- --analyze
+- analyze stdin text only do not execute
+- example
+- cat error.log | olm --analyze
+- --exec-stdin --yes
+- execute each stdin line as a command dangerous
+- --yes is required
+- example
+- printf "%s\n" "pwd" "ls -la" | olm --exec-stdin --yes
+
+# config
+- config file
+- ~/.config/olm/config.env
+- list
 - olm config list
+- get
 - olm config get KEY
+- set
 - olm config set KEY VALUE
+
+# history and logs
+- logs tail
+- olm --logs
+- history tail
 - olm history --last N
+- history search
 - olm history --grep WORD
-- olm -e "command"
-- olm --no-llm "command"
-- olm --analyze
-- olm --exec-stdin --yes
+
+# common keys
+- OLM_MODEL_STD
+- OLM_MODEL_LGT
+- OLM_MODEL_HVY
+- OLM_MODEL_FA
+- OLM_MODEL_FB
+- OLM_LANG
+- OLM_ALWAYS_PROMPT

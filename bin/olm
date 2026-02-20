@@ -1,15 +1,24 @@
 #!/usr/bin/env bash
+# olm - Output Logger & LLM Commentator (bash only)
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
-# symlink 経由でも repo ルートを正しく取る
+# ============================================================
+# repo root (symlink 対応)
+# ============================================================
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 REPO_ROOT="$(cd "$(dirname "$SCRIPT_PATH")/.." && pwd)"
 
+# ============================================================
+# config (user env)
+# ============================================================
 CFG_DIR="${OLM_CFG_DIR:-$HOME/.config/olm}"
 CFG_FILE="${OLM_CONFIG:-$CFG_DIR/config.env}"
 [ -f "$CFG_FILE" ] && source "$CFG_FILE" || true
 
+# ============================================================
+# paths
+# ============================================================
 DATA_DIR="${OLM_DATA_DIR:-$HOME/.local/share/olm}"
 LOG_DIR="${OLM_LOG_DIR:-$DATA_DIR}"
 LOG_FILE="${OLM_LOG_FILE:-$LOG_DIR/olm.log}"
@@ -17,29 +26,152 @@ HIST_FILE="${OLM_HIST_FILE:-$LOG_DIR/olm_history.tsv}"
 mkdir -p "$LOG_DIR"
 touch "$HIST_FILE" 2>/dev/null || true
 
+# ============================================================
+# defaults
+# ============================================================
+CMD_MAX_CHARS="${OLM_CMD_MAX_CHARS:-1500}"
+LLM_MAX_CHARS="${OLM_LLM_MAX_CHARS:-1500}"
+MAX_LINE_CHARS="${OLM_MAX_LINE_CHARS:-80}"
+MAX_EXPLAIN_CHARS="${OLM_MAX_EXPLAIN_CHARS:-450}"
+MAX_SUGGESTION_COMMANDS="${OLM_MAX_SUGGEST_CMDS:-5}"
+MAX_CONFIRM_COMMANDS="${OLM_MAX_CONFIRM_CMDS:-3}"
+
+DEFAULT_MODEL_CLOUD="${OLM_MODEL_STD:-gpt-oss:20b-cloud}"
+DEFAULT_MODEL_LIGHT="${OLM_MODEL_LGT:-phi3:3.8b-mini-4k-instruct-q4_k_m}"
+DEFAULT_MODEL_HEAVY="${OLM_MODEL_HVY:-llama3:8b}"
+FALLBACK_MODEL_LIGHT="${OLM_MODEL_FA:-qwen2.5:0.5b}"
+FALLBACK_MODEL_HEAVY="${OLM_MODEL_FB:-mistral-nemo:latest}"
+
+OLM_LANG="${OLM_LANG:-jp}"
+OLM_ALWAYS_PROMPT="${OLM_ALWAYS_PROMPT:-}"
+
+DEFAULT_MUTE_WORDS=(
+  "sessions should be nested with care, unset \$TMUX to force"
+  "bash: warning: setlocale: LC_ALL: cannot change locale"
+)
+
+# ============================================================
+# helpers
+# ============================================================
+contains_re() { printf '%s\n' "$1" | grep -qE "$2"; }
+
+trim_to() {
+  local s="$1" max="$2"
+  if [ "${#s}" -gt "$max" ]; then
+    printf '%s\n' "${s:0:$max}
+...(省略)"
+  else
+    printf '%s\n' "$s"
+  fi
+}
+
+mask_secrets() {
+  # ログ向け: ありがちな秘密情報を雑にマスク（完全ではない）
+  # - Authorization / Bearer / token / password / api_key など
+  sed -E \
+    -e 's/(Authorization:)[[:space:]]*[^[:space:]]+/\1 ***MASKED***/Ig' \
+    -e 's/(Bearer)[[:space:]]+[A-Za-z0-9._-]+/\1 ***MASKED***/Ig' \
+    -e 's/([Tt]oken=)[^[:space:]]+/\1***MASKED***/g' \
+    -e 's/([Pp]assword=)[^[:space:]]+/\1***MASKED***/g' \
+    -e 's/([Aa]pi[_-]?[Kk]ey=)[^[:space:]]+/\1***MASKED***/g'
+}
+
+is_sensitive_cmd() {
+  # デフォルトで履歴に残したくない系（危険/秘密の可能性）
+  # 0: sensitive, 1: ok
+  local c="$1"
+  printf '%s\n' "$c" | grep -qE \
+    '(^|[[:space:]])(rm|dd|mkfs|fdisk|parted|wipefs|shutdown|reboot|halt)([[:space:]]|$)|(--password|--token|--header|Authorization:|Bearer[[:space:]]|api[_-]?key|secret|private[_-]?key)'
+}
+
+extract_summary_line() {
+  # LLM出力から「解説=:」行の中身を1行で抜く
+  # 無ければ先頭行
+  local exp="$1"
+  local line
+  line="$(printf '%s\n' "$exp" | sed -n 's/^解説=[:：][[:space:]]*//p' | head -n 1)"
+  if [ -n "$line" ]; then
+    printf '%s\n' "$line"
+    return
+  fi
+  printf '%s\n' "$exp" | head -n 1
+}
+
 show_help() {
-  lang="${1-}"
-  [ -n "$lang" ] || lang="${OLM_LANG:-jp}"
+  local lang="${1-}"
+  [ -n "$lang" ] || lang="$OLM_LANG"
   [ "$lang" = "ja" ] && lang="jp"
   [ "$lang" = "jp" ] || [ "$lang" = "en" ] || lang="en"
-
-  help_file="$REPO_ROOT/$lang/help.txt"
+  local help_file="$REPO_ROOT/$lang/help.txt"
   [ -f "$help_file" ] || die "help not found: $help_file"
   cat "$help_file"
 }
 
-if [ "${1-}" = "--help" ] || [ "${1-}" = "-h" ]; then
-  shift || true
-  show_help "${1-}"
-  exit 0
-fi
-
-if [ "${1-}" = "--logs" ]; then
+show_logs() {
   [ -f "$LOG_FILE" ] || { echo "(no log)"; exit 0; }
-  tail -n 60 "$LOG_FILE"
-  exit 0
-fi
+  tail -n 80 "$LOG_FILE"
+}
 
+history_show() {
+  local n="${1:-50}" kw="${2:-}"
+  [ -f "$HIST_FILE" ] || { echo "(no history)"; exit 0; }
+  if [ -n "$kw" ]; then
+    tail -n "$n" "$HIST_FILE" | grep -iF "$kw" || true
+  else
+    tail -n "$n" "$HIST_FILE"
+  fi
+}
+
+config_list() {
+  [ -f "$CFG_FILE" ] || { echo "(no config) $CFG_FILE"; exit 0; }
+  # コメントと空行除外
+  grep -vE '^[[:space:]]*#|^[[:space:]]*$' "$CFG_FILE" || true
+}
+
+config_get() {
+  local key="$1"
+  [ -n "$key" ] || die "Usage: olm config get KEY"
+  [ -f "$CFG_FILE" ] || die "config not found: $CFG_FILE"
+  grep -E "^[[:space:]]*${key}=" "$CFG_FILE" | tail -n 1 || true
+}
+
+config_set() {
+  local key="$1" val="$2"
+  [ -n "$key" ] && [ -n "$val" ] || die "Usage: olm config set KEY VALUE"
+  printf '%s' "$key" | grep -qE '^[A-Z0-9_]+$' || die "invalid KEY: $key (A-Z0-9_ only)"
+
+  mkdir -p "$CFG_DIR"
+  [ -f "$CFG_FILE" ] || cp -a "$REPO_ROOT/config/config.env.example" "$CFG_FILE"
+
+  local tmp
+  tmp="$(mktemp)"
+  # 既存行を除外して末尾に追加
+  grep -vE "^[[:space:]]*${key}=" "$CFG_FILE" > "$tmp" || true
+  printf '%s="%s"\n' "$key" "$val" >> "$tmp"
+  mv "$tmp" "$CFG_FILE"
+  echo "OK: set ${key}"
+}
+
+# ============================================================
+# options
+# ============================================================
+DETAIL_MODE=0
+ANALYZE_STDIN_MODE=0
+EXEC_STDIN_MODE=0
+EXEC_YES=0
+NO_LLM=0
+ERROR_ONLY=0
+MUTE_ENABLED=1
+USER_EXTRA_PROMPT=""
+START_SERVE=0
+
+# fast paths
+case "${1-}" in
+  --help|-h) shift || true; show_help "${1-}"; exit 0 ;;
+  --logs) show_logs; exit 0 ;;
+esac
+
+# subcommands
 if [ "${1-}" = "olmhistory" ] || [ "${1-}" = "history" ]; then
   shift || true
   n=50
@@ -51,15 +183,331 @@ if [ "${1-}" = "olmhistory" ] || [ "${1-}" = "history" ]; then
       *) break ;;
     esac
   done
-
-  if [ -n "$kw" ]; then
-    tail -n "$n" "$HIST_FILE" | grep -iF "$kw" || true
-  else
-    tail -n "$n" "$HIST_FILE"
-  fi
+  history_show "$n" "$kw"
   exit 0
 fi
 
-# stub: just run command (next step: integrate full olm)
-[ "$#" -gt 0 ] || die 'Usage: olm "command"'
-bash -lc "$*"
+if [ "${1-}" = "config" ]; then
+  shift || true
+  case "${1-}" in
+    list) config_list; exit 0 ;;
+    get) shift || true; config_get "${1-}"; exit 0 ;;
+    set) shift || true; config_set "${1-}" "${2-}"; exit 0 ;;
+    *) die "Usage: olm config list|get|set" ;;
+  esac
+fi
+
+# option parse
+while [ "$#" -gt 0 ]; do
+  case "${1-}" in
+    -d|--detail) DETAIL_MODE=1; shift ;;
+    -p)
+      [ "$#" -ge 2 ] || die 'Usage: olm -p "追加指示" "command"'
+      USER_EXTRA_PROMPT="$2"; shift 2 ;;
+    --analyze) ANALYZE_STDIN_MODE=1; shift ;;
+    --exec-stdin) EXEC_STDIN_MODE=1; shift ;;
+    --yes) EXEC_YES=1; shift ;;
+    --no-llm) NO_LLM=1; shift ;;
+    -e|--error-only) ERROR_ONLY=1; shift ;;
+    --no-mute) MUTE_ENABLED=0; shift ;;
+    --start-serve) START_SERVE=1; shift ;;
+    --) shift; break ;;
+    *) break ;;
+  esac
+done
+
+[ -n "$USER_EXTRA_PROMPT" ] || USER_EXTRA_PROMPT="なし"
+
+if [ "$ANALYZE_STDIN_MODE" -eq 1 ] && [ "$EXEC_STDIN_MODE" -eq 1 ]; then
+  die "--analyze と --exec-stdin は同時指定できません"
+fi
+
+# ============================================================
+# input & run
+# ============================================================
+cmd=""
+output=""
+status=0
+mode_name="normal"
+prompt_extra=""
+
+if [ "$ANALYZE_STDIN_MODE" -eq 1 ]; then
+  mode_name="analyze"
+  stdin_text="$(cat || true)"
+  [ -n "${stdin_text//[[:space:]]/}" ] || die "--analyze は stdin が必要です"
+  cmd="(stdin-analyze)"
+  output="$stdin_text"
+  status=0
+
+elif [ "$EXEC_STDIN_MODE" -eq 1 ]; then
+  mode_name="exec-stdin"
+  [ "$EXEC_YES" -eq 1 ] || die "--exec-stdin は危険なため --yes が必須です"
+
+  stdin_lines="$(cat || true)"
+  [ -n "${stdin_lines//[[:space:]]/}" ] || die "--exec-stdin は stdin が必要です"
+
+  combined_out=""
+  last_status=0
+
+  while IFS= read -r line; do
+    # 空行は無視
+    [ -n "${line//[[:space:]]/}" ] || continue
+
+    cmd_line="$(printf "%s" "$line" | sed 's/#.*$//')"
+    comment="$(printf "%s" "$line" | grep -o '#.*$' || true)"
+    [ -n "$comment" ] && prompt_extra="${prompt_extra}${comment}\n"
+
+    [ -n "${cmd_line//[[:space:]]/}" ] || continue
+
+    out="$(bash -lc "$cmd_line" 2>&1)"
+    last_status=$?
+
+    printf '%s\n' "# ${cmd_line}"
+    printf '%s\n' "${out}"
+
+    combined_out="${combined_out}\n# ${cmd_line}\n${out}\n"
+  done
+
+  cmd="(stdin-exec)"
+  output="$combined_out"
+  status="$last_status"
+
+  if [ "$USER_EXTRA_PROMPT" = "なし" ]; then USER_EXTRA_PROMPT=""; fi
+  USER_EXTRA_PROMPT="${USER_EXTRA_PROMPT}
+${prompt_extra}"
+
+else
+  [ "$#" -gt 0 ] || die 'Usage: olm "command"'
+  cmd="$*"
+
+  tmp_out="$(mktemp)"
+  bash -lc "$cmd" >"$tmp_out" 2>&1
+  status=$?
+  cat "$tmp_out"
+  output="$(cat "$tmp_out")"
+  rm -f "$tmp_out"
+fi
+
+# ============================================================
+# mute + trim output for prompt/log
+# ============================================================
+muted_count=0
+if [ "$MUTE_ENABLED" -eq 1 ]; then
+  out_f="$output"
+  for mute_word in "${DEFAULT_MUTE_WORDS[@]}"; do
+    [ -n "$mute_word" ] || continue
+    if printf "%s\n" "$out_f" | grep -Fq "$mute_word"; then
+      out_f="$(printf "%s\n" "$out_f" | grep -vF "$mute_word" || true)"
+      muted_count=$((muted_count + 1))
+    fi
+  done
+  output="${out_f:-"(ミュート済み)"}"
+fi
+output="$(trim_to "$output" "$CMD_MAX_CHARS")"
+
+# ============================================================
+# extra diagnostics (non destructive checks only)
+# ============================================================
+extra_info=""
+full_text="$(printf '%s\n%s\n' "$cmd" "$output")"
+
+if [ "$ANALYZE_STDIN_MODE" -eq 0 ] && contains_re "$output" 'command not found|not found'; then
+  c0="$(printf '%s\n' "$cmd" | awk '{print $1}')"
+  extra_info="${extra_info}
+[実行を試みたコマンド] ${c0}
+[which ${c0}] $(which "$c0" 2>&1 || echo 'not found')
+[type ${c0}] $(type "$c0" 2>&1 || echo 'not found')
+[PATH] $PATH"
+fi
+
+if [ "$ANALYZE_STDIN_MODE" -eq 0 ] && contains_re "$output" 'No such file|No such file or directory'; then
+  p0="$(printf '%s\n' "$full_text" | grep -oE '(/[A-Za-z0-9._/-]+)' | head -n1 || true)"
+  if [ -n "$p0" ]; then
+    extra_info="${extra_info}
+[対象パス] ${p0}
+[現在地] $(pwd)"
+  fi
+fi
+
+if [ "$ANALYZE_STDIN_MODE" -eq 0 ] && printf '%s\n' "$cmd $output" | grep -qE '\bpython[0-9]*\b|ModuleNotFoundError|ImportError'; then
+  extra_info="${extra_info}
+[Python] $(command -v python3 2>&1 || echo 'not found') / $(python3 --version 2>&1 || echo 'failed')"
+fi
+
+if [ "$ANALYZE_STDIN_MODE" -eq 0 ] && contains_re "$output" 'Permission denied'; then
+  extra_info="${extra_info}
+[whoami] $(whoami)
+[groups] $(groups)"
+fi
+
+if [ -n "$extra_info" ] && [ "${#extra_info}" -gt 4000 ]; then
+  extra_info="${extra_info:0:4000}
+...(省略)"
+fi
+
+# ============================================================
+# LLM prompt
+# ============================================================
+create_prompt() {
+  local CORE_RULE="**絶対厳守規則**:
+1. 思考プロセス・英語のメモ・\"Thinking\"・\"We need to\" などは一切出力しない
+2. 出力はすべて日本語のみ。英単語は必要最小限の技術用語のみ許可
+3. 各ラベルの形式を厳守する（例: 解説=: 〜）
+4. 各項目は最大3行以内。1行あたりおよそ${MAX_LINE_CHARS}文字以内
+5. 解説部分の合計はおよそ${MAX_EXPLAIN_CHARS}文字以内
+6. 一般論は禁止。[出力] と [診断情報] から分かる範囲だけで説明
+7. コマンド候補はコピペ可能な形。行頭は必ず \"\$ \"
+8. コマンド候補は最大${MAX_SUGGESTION_COMMANDS}個、確認コマンドは最大${MAX_CONFIRM_COMMANDS}個
+9. 確認コマンドは非破壊のみ (grep, find, ls, cat, head, tail, stat, ip, ss, ping, journalctl)
+10. 複数コマンド実行時は最後に失敗した箇所を優先して説明"
+
+  local ALWAYS=""
+  [ -n "$OLM_ALWAYS_PROMPT" ] && ALWAYS="[常時指示] ${OLM_ALWAYS_PROMPT}"
+
+  if [ "$ANALYZE_STDIN_MODE" -eq 1 ]; then
+    printf "%b" "${CORE_RULE}
+
+${ALWAYS}
+[モード] stdin-analyze (実行しない)
+[入力] $output
+[追加指示] ${USER_EXTRA_PROMPT}
+
+解説=:
+コマンド候補=:
+確認コマンド=:"
+    return
+  fi
+
+  if [ "$status" -eq 0 ]; then
+    printf "%b" "${CORE_RULE}
+
+${ALWAYS}
+[コマンド] $cmd
+[終了ステータス] $status
+[出力] $output
+[追加指示] ${USER_EXTRA_PROMPT}
+
+解説=:
+コマンド候補=:
+確認コマンド=:"
+  else
+    printf "%b" "${CORE_RULE}
+
+${ALWAYS}
+[コマンド] $cmd
+[終了ステータス] $status
+[出力] $output
+[診断情報] ${extra_info:-なし}
+[追加指示] ${USER_EXTRA_PROMPT}
+
+解説=:
+エラー原因(3行)=:
+改善案(3行)=:
+コマンド候補=:
+確認コマンド=:"
+  fi
+}
+
+# ============================================================
+# LLM run (optional)
+# ============================================================
+MODEL_USED="(skip)"
+exp=""
+
+should_llm=1
+if [ "$NO_LLM" -eq 1 ]; then
+  should_llm=0
+fi
+if [ "$ERROR_ONLY" -eq 1 ] && [ "$status" -eq 0 ] && [ "$ANALYZE_STDIN_MODE" -eq 0 ]; then
+  should_llm=0
+fi
+
+if [ "$should_llm" -eq 1 ]; then
+  command -v ollama >/dev/null 2>&1 || die "ollama が見つかりません"
+
+  if ! pgrep -f "ollama serve" >/dev/null 2>&1; then
+    if [ "$START_SERVE" -eq 1 ]; then
+      ollama serve > "$LOG_DIR/ollama.log" 2>&1 &
+      sleep 2
+    fi
+  fi
+  pgrep -f "ollama serve" >/dev/null 2>&1 || die "ollama serve が動いていません (--start-serve)"
+
+  if [ "$ANALYZE_STDIN_MODE" -eq 1 ]; then
+    MODELS=("$DEFAULT_MODEL_CLOUD" "$DEFAULT_MODEL_HEAVY" "$FALLBACK_MODEL_HEAVY")
+  else
+    if [ "$status" -eq 0 ]; then
+      MODELS=("$DEFAULT_MODEL_CLOUD" "$DEFAULT_MODEL_LIGHT" "$FALLBACK_MODEL_LIGHT")
+      [ "$DETAIL_MODE" -eq 1 ] && MODELS=("$DEFAULT_MODEL_CLOUD" "$DEFAULT_MODEL_HEAVY" "$FALLBACK_MODEL_HEAVY")
+    else
+      MODELS=("$DEFAULT_MODEL_CLOUD" "$DEFAULT_MODEL_HEAVY" "$FALLBACK_MODEL_HEAVY")
+    fi
+  fi
+
+  prompt_content="$(create_prompt)"
+  tmp_exp="$(mktemp)"
+  tmp_err="$(mktemp)"
+  ok=1
+
+  for model_name in "${MODELS[@]}"; do
+    [ -n "$model_name" ] || continue
+    if printf "%s" "$prompt_content" | ollama run "$model_name" 2>"$tmp_err" | \
+      grep -v "^Thinking\.\.\." | \
+      grep -v "^\.\.\.done thinking\." | \
+      grep -v "^We need to" > "$tmp_exp"; then
+      exp="$(cat "$tmp_exp" 2>/dev/null || true)"
+      if [ -n "${exp//[[:space:]]/}" ]; then
+        MODEL_USED="$model_name"
+        ok=0
+        break
+      fi
+    fi
+  done
+
+  if [ "$ok" -ne 0 ]; then
+    exp="(LLM出力なし)
+$(cat "$tmp_err" 2>/dev/null || true)"
+    MODEL_USED="FAILURE"
+  fi
+
+  rm -f "$tmp_exp" "$tmp_err"
+  exp="$(trim_to "$exp" "$LLM_MAX_CHARS")"
+fi
+
+# ============================================================
+# logging (default: do not log sensitive)
+# ============================================================
+now="$(date '+%Y-%m-%d %H:%M:%S')"
+summary="$(extract_summary_line "$exp")"
+summary="$(printf '%s\n' "$summary" | tr '\t' ' ' | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g' | head -c 240)"
+
+log_ok=1
+if [ "$ANALYZE_STDIN_MODE" -eq 0 ] && [ "$EXEC_STDIN_MODE" -eq 0 ]; then
+  if is_sensitive_cmd "$cmd"; then
+    log_ok=0
+  fi
+fi
+
+if [ "$log_ok" -eq 1 ]; then
+  {
+    echo "----- $now -----"
+    echo "CMD: $cmd"
+    echo "STATUS: $status"
+    echo "MODE: $mode_name"
+    echo "MODEL: $MODEL_USED"
+    echo "MUTE: $MUTE_ENABLED (hits=$muted_count)"
+    echo "OUTPUT <<EOF"
+    printf '%s\n' "$output" | mask_secrets
+    echo "EOF"
+    echo "EXPLANATION <<EOF"
+    printf '%s\n' "$exp"
+    echo "EOF"
+  } >> "$LOG_FILE"
+
+  printf '%s\t%s\t%s\t%s\n' "$now" "$status" "$cmd" "$summary" >> "$HIST_FILE"
+fi
+
+# LLM出力があるときだけ表示（無い場合は何も追加表示しない）
+[ -n "${exp//[[:space:]]/}" ] && printf '%s\n' "$exp"
+
+exit "$status"

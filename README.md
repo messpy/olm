@@ -1,8 +1,8 @@
 # olm
-- shell command output helper
+- shell command helper
 - run command and explain output
-- analyze stdin text
-- keep history
+- analyze text from stdin
+- keep history as tsv
 - config via ~/.config/olm/config.env
 
 # install
@@ -11,12 +11,21 @@
 - olm --help
 
 # config
-- copy config/config.env.example to ~/.config/olm/config.env
-- set OLM_MODEL_STD OLM_MODEL_LGT OLM_MODEL_HVY OLM_MODEL_FA OLM_MODEL_FB
-- set OLM_LANG
-- set OLM_ALWAYS_PROMPT
+- if ~/.config/olm/config.env does not exist it will be created from config/config.env.example
+- key examples
+- OLM_MODEL_STD
+- OLM_MODEL_LGT
+- OLM_MODEL_HVY
+- OLM_MODEL_FA
+- OLM_MODEL_FB
+- OLM_LANG
+- OLM_ALWAYS_PROMPT
 
 # usage
 - olm "ls -la"
-- journalctl -u ssh -n 200 | olm --analyze
-- olmhistory --last 20
+- olm -e "ls /nope"
+- echo "some log text" | olm --analyze
+- printf "%s\n" "pwd" "ls -la" | olm --exec-stdin --yes
+- olm config list
+- olm config set OLM_LANG jp
+- olm history --last 50

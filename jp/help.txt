@@ -3,11 +3,12 @@ Usage
 - olm --help jp
 - olm --help en
 - olm --logs
-- olm config set KEY VALUE
-- olm config get KEY
 - olm config list
-- olmhistory --last N
-- olmhistory --grep WORD
-- olm "command"
-- text | olm --analyze
-- lines | olm --exec-stdin --yes
+- olm config get KEY
+- olm config set KEY VALUE
+- olm history --last N
+- olm history --grep WORD
+- olm -e "command"
+- olm --no-llm "command"
+- olm --analyze
+- olm --exec-stdin --yes

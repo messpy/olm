@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+# symlink 経由でも repo ルートを正しく取る
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+REPO_ROOT="$(cd "$(dirname "$SCRIPT_PATH")/.." && pwd)"
+
+CFG_DIR="${OLM_CFG_DIR:-$HOME/.config/olm}"
+CFG_FILE="${OLM_CONFIG:-$CFG_DIR/config.env}"
+[ -f "$CFG_FILE" ] && source "$CFG_FILE" || true
+
+DATA_DIR="${OLM_DATA_DIR:-$HOME/.local/share/olm}"
+LOG_DIR="${OLM_LOG_DIR:-$DATA_DIR}"
+LOG_FILE="${OLM_LOG_FILE:-$LOG_DIR/olm.log}"
+HIST_FILE="${OLM_HIST_FILE:-$LOG_DIR/olm_history.tsv}"
+mkdir -p "$LOG_DIR"
+touch "$HIST_FILE" 2>/dev/null || true
+
+show_help() {
+  lang="${1-}"
+  [ -n "$lang" ] || lang="${OLM_LANG:-jp}"
+  [ "$lang" = "ja" ] && lang="jp"
+  [ "$lang" = "jp" ] || [ "$lang" = "en" ] || lang="en"
+
+  help_file="$REPO_ROOT/$lang/help.txt"
+  [ -f "$help_file" ] || die "help not found: $help_file"
+  cat "$help_file"
+}
+
+if [ "${1-}" = "--help" ] || [ "${1-}" = "-h" ]; then
+  shift || true
+  show_help "${1-}"
+  exit 0
+fi
+
+if [ "${1-}" = "--logs" ]; then
+  [ -f "$LOG_FILE" ] || { echo "(no log)"; exit 0; }
+  tail -n 60 "$LOG_FILE"
+  exit 0
+fi
+
+if [ "${1-}" = "olmhistory" ] || [ "${1-}" = "history" ]; then
+  shift || true
+  n=50
+  kw=""
+  while [ "$#" -gt 0 ]; do
+    case "${1-}" in
+      --last) n="${2-}"; shift 2 ;;
+      --grep) kw="${2-}"; shift 2 ;;
+      *) break ;;
+    esac
+  done
+
+  if [ -n "$kw" ]; then
+    tail -n "$n" "$HIST_FILE" | grep -iF "$kw" || true
+  else
+    tail -n "$n" "$HIST_FILE"
+  fi
+  exit 0
+fi
+
+# stub: just run command (next step: integrate full olm)
+[ "$#" -gt 0 ] || die 'Usage: olm "command"'
+bash -lc "$*"

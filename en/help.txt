@@ -1,0 +1,13 @@
+Usage
+- olm --help
+- olm --help jp
+- olm --help en
+- olm --logs
+- olm config set KEY VALUE
+- olm config get KEY
+- olm config list
+- olmhistory --last N
+- olmhistory --grep WORD
+- olm "command"
+- text | olm --analyze
+- lines | olm --exec-stdin --yes

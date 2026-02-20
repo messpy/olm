@@ -42,7 +42,7 @@ DEFAULT_MODEL_HEAVY="${OLM_MODEL_HVY:-llama3:8b}"
 FALLBACK_MODEL_LIGHT="${OLM_MODEL_FA:-qwen2.5:0.5b}"
 FALLBACK_MODEL_HEAVY="${OLM_MODEL_FB:-mistral-nemo:latest}"
 
-OLM_LANG="${OLM_LANG:-jp}"
+OLM_LANG="${OLM_LANG:-en}"
 OLM_ALWAYS_PROMPT="${OLM_ALWAYS_PROMPT:-}"
 
 DEFAULT_MUTE_WORDS=(
@@ -85,16 +85,36 @@ is_sensitive_cmd() {
 }
 
 extract_summary_line() {
-  # LLM出力から「解説=:」行の中身を1行で抜く
-  # 無ければ先頭行
+  # LLM出力の先頭要約行を1行で抜く（コマンド解説の1行目を優先）
   local exp="$1"
   local line
-  line="$(printf '%s\n' "$exp" | sed -n 's/^解説=[:：][[:space:]]*//p' | head -n 1)"
+
+  line="$(printf '%s
+' "$exp" | awk '
+    BEGIN{in=0}
+    $0 ~ /^コマンド解説=[:：][[:space:]]*$/ {in=1; next}
+    $0 ~ /^Command Explanation=[:：][[:space:]]*$/ {in=1; next}
+    in && $0 !~ /^[[:space:]]*$/ {print; exit}
+  ')"
+
   if [ -n "$line" ]; then
-    printf '%s\n' "$line"
+    printf '%s
+' "$line"
     return
   fi
-  printf '%s\n' "$exp" | head -n 1
+
+  # fallback: 先頭の「ラベル行/コマンド行」以外の非空行
+  line="$(printf '%s
+' "$exp" | awk '
+    $0 ~ /^[[:space:]]*$/ {next}
+    $0 ~ /^(コマンド解説|結果の解説|次回コマンド候補)=[:：]/ {next}
+    $0 ~ /^(Command Explanation|Result Explanation|Next Command Candidates)=[:：]/ {next}
+    $0 ~ /^\$ / {next}
+    {print; exit}
+  ')"
+  [ -n "$line" ] && printf '%s
+' "$line" || printf '%s
+' "$exp" | head -n 1
 }
 
 show_help() {
@@ -349,32 +369,63 @@ fi
 # LLM prompt
 # ============================================================
 create_prompt() {
-  local CORE_RULE="**絶対厳守規則**:
-1. 思考プロセス・英語のメモ・\"Thinking\"・\"We need to\" などは一切出力しない
-2. 出力はすべて日本語のみ。英単語は必要最小限の技術用語のみ許可
-3. 各ラベルの形式を厳守する（例: 解説=: 〜）
-4. 各項目は最大3行以内。1行あたりおよそ${MAX_LINE_CHARS}文字以内
-5. 解説部分の合計はおよそ${MAX_EXPLAIN_CHARS}文字以内
-6. 一般論は禁止。[出力] と [診断情報] から分かる範囲だけで説明
-7. コマンド候補はコピペ可能な形。行頭は必ず \"\$ \"
-8. コマンド候補は最大${MAX_SUGGESTION_COMMANDS}個、確認コマンドは最大${MAX_CONFIRM_COMMANDS}個
-9. 確認コマンドは非破壊のみ (grep, find, ls, cat, head, tail, stat, ip, ss, ping, journalctl)
-10. 複数コマンド実行時は最後に失敗した箇所を優先して説明"
+  local lang="${OLM_LANG:-en}"
+  [ "$lang" = "ja" ] && lang="jp"
+  [ "$lang" = "jp" ] || [ "$lang" = "en" ] || lang="en"
+
+  local is_jp=0
+  [ "$lang" = "jp" ] && is_jp=1
+
+  local out_lang_rule=""
+  local label_cmd=""
+  local label_res=""
+  local label_next=""
+
+  if [ "$is_jp" -eq 1 ]; then
+    out_lang_rule="出力はすべて日本語のみ。英単語は必要最小限の技術用語のみ許可。"
+    label_cmd="コマンド解説=:"
+    label_res="結果の解説=:"
+    label_next="次回コマンド候補=:"
+  else
+    out_lang_rule="Output must be in English only. Use Japanese only for unavoidable proper nouns."
+    label_cmd="Command Explanation=:"
+    label_res="Result Explanation=:"
+    label_next="Next Command Candidates=:"
+  fi
+
+  local lines_per_section=2
+  local explain_chars=220
+  if [ "${DETAIL_MODE:-0}" -eq 1 ]; then
+    lines_per_section=5
+    explain_chars="$MAX_EXPLAIN_CHARS"
+  fi
+
+  local CORE_RULE="**STRICT RULES**:
+1. Do NOT output any internal reasoning, notes, \"Thinking\", or meta commentary
+2. ${out_lang_rule}
+3. Keep the label format exactly (example: ${label_cmd})
+4. Each section is up to ${lines_per_section} lines, each line about ${MAX_LINE_CHARS} chars
+5. Total explanation should be about ${explain_chars} chars
+6. No generic theory. Explain only from [Command]/[Output]/[Diagnostics] (if any)
+7. Command candidates must be copy-paste ready and each line MUST start with \"\$ \"
+8. Up to ${MAX_SUGGESTION_COMMANDS} command candidates
+9. Candidates should be NON-DESTRUCTIVE checks first (grep, find, ls, cat, head, tail, stat, ip, ss, ping, journalctl)
+10. If multiple commands were run, prioritize the last failure"
 
   local ALWAYS=""
-  [ -n "$OLM_ALWAYS_PROMPT" ] && ALWAYS="[常時指示] ${OLM_ALWAYS_PROMPT}"
+  [ -n "$OLM_ALWAYS_PROMPT" ] && ALWAYS="[Always Instruction] ${OLM_ALWAYS_PROMPT}"
 
   if [ "$ANALYZE_STDIN_MODE" -eq 1 ]; then
     printf "%b" "${CORE_RULE}
 
 ${ALWAYS}
-[モード] stdin-analyze (実行しない)
-[入力] $output
-[追加指示] ${USER_EXTRA_PROMPT}
+[Mode] stdin-analyze (do not execute)
+[Input] $output
+[Extra Instruction] ${USER_EXTRA_PROMPT}
 
-解説=:
-コマンド候補=:
-確認コマンド=:"
+${label_cmd}
+${label_res}
+${label_next}"
     return
   fi
 
@@ -382,29 +433,27 @@ ${ALWAYS}
     printf "%b" "${CORE_RULE}
 
 ${ALWAYS}
-[コマンド] $cmd
-[終了ステータス] $status
-[出力] $output
-[追加指示] ${USER_EXTRA_PROMPT}
+[Command] $cmd
+[Exit Status] $status
+[Output] $output
+[Extra Instruction] ${USER_EXTRA_PROMPT}
 
-解説=:
-コマンド候補=:
-確認コマンド=:"
+${label_cmd}
+${label_res}
+${label_next}"
   else
     printf "%b" "${CORE_RULE}
 
 ${ALWAYS}
-[コマンド] $cmd
-[終了ステータス] $status
-[出力] $output
-[診断情報] ${extra_info:-なし}
-[追加指示] ${USER_EXTRA_PROMPT}
+[Command] $cmd
+[Exit Status] $status
+[Output] $output
+[Diagnostics] ${extra_info:-none}
+[Extra Instruction] ${USER_EXTRA_PROMPT}
 
-解説=:
-エラー原因(3行)=:
-改善案(3行)=:
-コマンド候補=:
-確認コマンド=:"
+${label_cmd}
+${label_res}
+${label_next}"
   fi
 }
 

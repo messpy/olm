@@ -1,0 +1,508 @@
+#!/usr/bin/env bash
+
+# ============================================================
+# 設定セクション
+# ============================================================
+
+# --- ログ設定 ---
+LOG_DIR="${OLM_LOG_DIR:-$HOME/log}"
+LOG_FILE="${OLM_LOG_FILE:-$LOG_DIR/olm.log}"
+
+# --- 出力制限 ---
+# コマンド実行結果の保持上限
+CMD_MAX_CHARS="${OLM_CMD_MAX_CHARS:-1000}"
+# LLM からの解説出力の最大文字数（超えたらカット）
+LLM_MAX_CHARS="${OLM_LLM_MAX_CHARS:-1000}"
+# 解説テキスト 1 行あたりの目安文字数（LLM への指示のみ）
+MAX_LINE_CHARS="${OLM_MAX_LINE_CHARS:-80}"
+# 「解説=:」の合計最大文字数（LLM への指示のみ）
+MAX_EXPLAIN_CHARS="${OLM_MAX_EXPLAIN_CHARS:-400}"
+
+# --- コマンド候補の上限 ---
+MAX_SUGGESTION_COMMANDS="${OLM_MAX_SUGGEST_CMDS:-5}"
+MAX_CONFIRM_COMMANDS="${OLM_MAX_CONFIRM_CMDS:-3}"
+
+# --- LLMモデル定義 ---
+# 標準: cloud 側のモデル
+DEFAULT_MODEL_CLOUD="${OLM_MODEL_STD:-gpt-oss:20b-cloud}"
+# ライト: 普通のローカルモデル
+DEFAULT_MODEL_LIGHT="${OLM_MODEL_LGT:-phi3:3.8b-mini-4k-instruct-q4_k_m}"
+# ヘビー: 重めのローカルモデル
+DEFAULT_MODEL_HEAVY="${OLM_MODEL_HVY:-llama3:8b}"
+FALLBACK_MODEL_LIGHT="${OLM_MODEL_FA:-qwen2.5:0.5b}"
+FALLBACK_MODEL_HEAVY="${OLM_MODEL_FB:-mistral-nemo:latest}"
+
+# --- ミュートワード設定 ---
+DEFAULT_MUTE_WORDS=(
+  "sessions should be nested with care, unset \$TMUX to force"
+  "bash: warning: setlocale: LC_ALL: cannot change locale"
+)
+
+mkdir -p "$LOG_DIR"
+
+# ============================================================
+# 依存コマンドチェック
+# ============================================================
+if ! command -v ollama >/dev/null 2>&1; then
+  echo "ERROR: ollama が見つかりません。" >&2
+  exit 127
+fi
+
+if ! pgrep -f "ollama serve" >/dev/null 2>&1; then
+  ollama serve > "$LOG_DIR/ollama.log" 2>&1 &
+  sleep 3
+  if ! pgrep -f "ollama serve" >/dev/null 2>&1; then
+    echo "ERROR: ollama serve の起動に失敗しました。" >&2
+    exit 128
+  fi
+fi
+
+print_help() {
+  cat <<USAGE
+Usage:
+  olm [--help] [--logs]
+  olm [-d] [-p "追加プロンプト"] <command...>
+  <something> | olm --analyze [-p "追加プロンプト"]
+
+機能:
+  - シェルコマンドを実行し、結果を日本語で短く解説
+  - エラー時は原因・改善案・候補コマンド・確認コマンドを提案
+  - --analyze モードでは標準入力で渡した複数行テキストを要約・診断
+
+モード:
+  通常:     標準 → ライト/ヘビー（エラー時のみヘビー優先）
+  --analyze: 標準 → ヘビー（ライトは使わない）
+
+オプション:
+  --help, -h         ヘルプ表示
+  --logs             ログ表示
+  --analyze          標準入力の複数行をまとめて解説（コマンド実行しない）
+  -d                 詳細モード（成功時でもヘビーモデルを使う）
+  -p "追加指示"      LLM への追加指示
+USAGE
+}
+
+# ============================================================
+# サブコマンド処理
+# ============================================================
+if [ "${1-}" = "--help" ] || [ "${1-}" = "-h" ]; then
+  print_help
+  exit 0
+fi
+
+if [ "${1-}" = "--logs" ]; then
+  echo "Log file: $LOG_FILE"
+  if [ ! -f "$LOG_FILE" ]; then
+    echo "ログファイルはまだありません。"
+    exit 0
+  fi
+  tail -n 40 "$LOG_FILE"
+  exit 0
+fi
+
+# ============================================================
+# オプション解析
+# ============================================================
+DETAIL_MODE=0
+USER_EXTRA_PROMPT=""
+ANALYZE_STDIN_MODE=0
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -d)
+      DETAIL_MODE=1
+      shift
+      ;;
+    -p)
+      if [ "$#" -lt 2 ]; then
+        echo "Usage: olm -p \"追加プロンプト\" <command...>" >&2
+        exit 1
+      fi
+      USER_EXTRA_PROMPT="$2"
+      shift 2
+      ;;
+    --analyze)
+      ANALYZE_STDIN_MODE=1
+      shift
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+[ -n "$USER_EXTRA_PROMPT" ] || USER_EXTRA_PROMPT="なし"
+
+cmd=""
+output=""
+status=0
+
+# ============================================================
+# モード別入力取得
+# ============================================================
+if [ "$ANALYZE_STDIN_MODE" -eq 1 ]; then
+  # 標準入力で複数のコマンド行を受け取り、実際に実行してからまとめて解析するモード
+  # 「2行連続の空行」で入力終了
+
+  echo "▼ 実行したいコマンドを入力してください（2行連続の空行で終了）" >&2
+
+  input_lines=()
+  empty_count=0
+
+  while IFS= read -r line; do
+    if [ -z "$line" ]; then
+      empty_count=$((empty_count + 1))
+      [ "$empty_count" -ge 2 ] && break
+    else
+      empty_count=0
+      input_lines+=("$line")
+    fi
+  done
+
+  if [ "${#input_lines[@]}" -eq 0 ]; then
+    echo "ERROR: --analyze モードでは標準入力からコマンド行を受け取ります。" >&2
+    exit 1
+  fi
+
+  combined_out=""
+  prompt_extra=""
+
+  for l in "${input_lines[@]}"; do
+    # 1行内の「#」以降はコメントとして扱い、プロンプト専用にする
+    cmd_line="$(printf "%s" "$l" | sed 's/#.*$//')"
+    comment="$(printf "%s" "$l" | grep -o '#.*$' || true)"
+
+    # コメントは LLM への追加指示として蓄積
+    if [ -n "$comment" ]; then
+      prompt_extra="${prompt_extra}${comment}\n"
+    fi
+
+    # コマンド部分が空ならスキップ
+    if [ -n "$cmd_line" ]; then
+      # 実際にコマンドを実行
+      out="$(bash -lc "$cmd_line" 2>&1)"
+
+      # ターミナルにもそのまま出す（どのコマンドの出力か分かるように）
+      printf '%s\n' "# ${cmd_line}"
+      printf '%s\n' "${out}"
+
+      # ログ／LLM 用にまとめて保持
+      combined_out="${combined_out}\n# ${cmd_line}\n${out}\n"
+    fi
+  done
+
+  cmd="(stdin-exec)"
+  output="$combined_out"
+  status=0
+
+  # 既存の USER_EXTRA_PROMPT とコメント由来プロンプトをマージ
+  if [ "$USER_EXTRA_PROMPT" = "なし" ]; then
+    USER_EXTRA_PROMPT=""
+  fi
+  USER_EXTRA_PROMPT="${USER_EXTRA_PROMPT}
+${prompt_extra}"
+else
+  if [ "$#" -eq 0 ]; then
+    echo "Usage: olm [-d] [-p \"追加プロンプト\"] <command...>" >&2
+    exit 1
+  fi
+
+  cmd="$*"
+  tmp_out="$(mktemp)"
+
+  # コマンド実行
+  bash -lc "$cmd" >"$tmp_out" 2>&1
+  status=$?
+
+  # 実行結果をそのままターミナルにも出す
+  cat "$tmp_out"
+  output="$(cat "$tmp_out")"
+  rm -f "$tmp_out"
+fi
+# ============================================================
+# 出力のミュート処理
+# ============================================================
+output_filtered="$output"
+
+for mute_word in "${DEFAULT_MUTE_WORDS[@]}"; do
+  if [ -n "$mute_word" ]; then
+    if printf "%s\n" "$output_filtered" | grep -Fq "$mute_word"; then
+      output_filtered="$(printf "%s\n" "$output_filtered" | grep -vF "$mute_word" || true)"
+    fi
+  fi
+done
+
+if [ -n "$output_filtered" ]; then
+  output="$output_filtered"
+else
+  output="(ミュート済み)"
+fi
+
+# コマンド出力の文字数制限
+if [ "${#output}" -gt "$CMD_MAX_CHARS" ]; then
+  output="${output:0:$CMD_MAX_CHARS}
+...(省略)"
+fi
+
+# ============================================================
+# エラー診断情報の付加
+# ============================================================
+extra_info=""
+
+contains() {
+  printf '%s\n' "$1" | grep -qE "$2"
+}
+
+full_text="$(printf '%s\n%s\n' "$cmd" "$output")"
+
+# command not found
+if [ "$ANALYZE_STDIN_MODE" -eq 0 ] && contains "$output" 'command not found|not found'; then
+  cmd_candidate="$(printf '%s\n' "$cmd" | awk '{print $1}')"
+  extra_info="${extra_info}
+[実行を試みたコマンド] ${cmd_candidate}"
+
+  if [ "$cmd_candidate" = "olana" ]; then
+    extra_info="${extra_info}
+[TYPO検出] 'ollama' の可能性が高い"
+  elif [ "$cmd_candidate" = "sse" ]; then
+    extra_info="${extra_info}
+[TYPO検出] 'ssh' の可能性が高い"
+  elif [ "$cmd_candidate" = "gti" ]; then
+    extra_info="${extra_info}
+[TYPO検出] 'git' の可能性が高い"
+  fi
+
+  extra_info="${extra_info}
+[which ${cmd_candidate}] $(which "$cmd_candidate" 2>&1 || echo 'not found')"
+  extra_info="${extra_info}
+[type ${cmd_candidate}] $(type "$cmd_candidate" 2>&1 || echo 'not found')"
+  extra_info="${extra_info}
+[現在のPATH] $PATH"
+fi
+
+# No such file
+if [ "$ANALYZE_STDIN_MODE" -eq 0 ] && contains "$output" 'No such file|No such file or directory'; then
+  path_candidate="$(printf '%s\n' "$full_text" | grep -oE '(/[A-Za-z0-9._/-]+)' | head -n1 || true)"
+  if [ -z "$path_candidate" ]; then
+    path_candidate="$(printf '%s\n' "$full_text" | grep -oE '[A-Za-z0-9._-]+\.(log|py|txt|conf|sh|cfg|yaml|yml|json)' | head -n1 || true)"
+  fi
+  if [ -n "$path_candidate" ]; then
+    extra_info="${extra_info}
+[対象パス] ${path_candidate}"
+    extra_info="${extra_info}
+[ls -la ${path_candidate}] $(ls -la "$path_candidate" 2>&1 || echo 'not found')"
+    dir_candidate="$(dirname "$path_candidate" 2>/dev/null || echo .)"
+    extra_info="${extra_info}
+[ls -la ${dir_candidate}] $(ls -la "$dir_candidate" 2>&1 | head -10 || echo 'not found')"
+    extra_info="${extra_info}
+[現在地] $(pwd)"
+  fi
+fi
+
+# Python 関連
+if [ "$ANALYZE_STDIN_MODE" -eq 0 ] && printf '%s\n' "$cmd" "$output" | grep -qE '\bpython[0-9]*\b|ModuleNotFoundError|ImportError'; then
+  extra_info="${extra_info}
+[Python環境] $(which python3 2>&1 || echo 'not found') / $(python3 --version 2>&1 || echo 'failed')"
+  module_name="$(printf '%s\n' "$output" | grep -oE "No module named '[^']+'" | head -1 | sed "s/No module named '//;s/'//" || true)"
+  if [ -n "$module_name" ]; then
+    extra_info="${extra_info}
+[不足モジュール] ${module_name}"
+  fi
+fi
+
+# Permission denied
+if [ "$ANALYZE_STDIN_MODE" -eq 0 ] && contains "$output" 'Permission denied'; then
+  extra_info="${extra_info}
+[現在のユーザー] $(whoami)"
+  extra_info="${extra_info}
+[グループ] $(groups)"
+fi
+
+# ネットワーク系
+if [ "$ANALYZE_STDIN_MODE" -eq 0 ] && contains "$output" 'Connection timed out|No route to host|Network is unreachable|Connection refused'; then
+  target_host="$(printf '%s\n' "$full_text" | grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3}' | head -1 || true)"
+  if [ -n "$target_host" ]; then
+    extra_info="${extra_info}
+[接続先] ${target_host}"
+    extra_info="${extra_info}
+[ping テスト] $(ping -c 1 -W 2 "$target_host" 2>&1 | head -3 || echo 'failed')"
+  fi
+fi
+
+# extra_info 全体の長さ制限（念のため）
+if [ -n "$extra_info" ] && [ "${#extra_info}" -gt 4000 ]; then
+  extra_info="${extra_info:0:4000}
+...(省略)"
+fi
+
+# ============================================================
+# プロンプト作成
+# ============================================================
+create_prompt() {
+  local CORE_RULE="**絶対厳守規則**:
+1. 思考プロセス・英語のメモ・\"Thinking\"・\"We need to\" などは一切出力しない
+2. 出力はすべて日本語のみ。英単語は必要最小限の技術用語のみ許可
+3. 各ラベルの形式を厳守する（例: 解説=: 〜）
+4. 各項目は最大3行以内。1行あたりおよそ${MAX_LINE_CHARS}文字以内を目安に短くまとめる
+5. 解説部分の合計文字数はおよそ${MAX_EXPLAIN_CHARS}文字以内に収める
+6. 一般的なLinuxの教科書的説明は禁止。[出力] と [診断情報] から分かる範囲だけで推論する
+7. コマンド候補は実際にコピペして使える形で書く。行頭に必ず \"\$ \" を付ける
+8. コマンド候補は最大${MAX_SUGGESTION_COMMANDS}個、確認コマンドは最大${MAX_CONFIRM_COMMANDS}個とし、不要なら少なくてよい
+9. 確認コマンドは必ず非破壊的なものに限定する (例: grep, find, ls, cat, ping, ssh 接続テスト程度まで)
+10. 1回の実行で複数のサブコマンド（例: cmd1 && cmd2 && cmd3）がある場合、
+    文字数制限があっても **最後に失敗したコマンドとそのエラー内容** を必ず優先して説明すること。
+    どのサブコマンドが問題の本体かが分からない説明は不可とする。"
+
+  if [ "$ANALYZE_STDIN_MODE" -eq 1 ]; then
+    printf "%b" "${CORE_RULE}
+
+[モード] stdin-analyze (複数行のテキストをまとめて解説)
+[入力内容] $output
+[追加指示] ${USER_EXTRA_PROMPT}
+
+**回答形式 (各3行以内)**:
+
+解説=:
+(この入力テキストが何を示しているか、重要なポイントを3行以内で要約)
+
+コマンド候補=:
+(このテキストをさらに調査・分析するための候補コマンド。最大${MAX_SUGGESTION_COMMANDS}個。
+行頭に \"\$ \" を付けて、1行コメント → 1行コマンド のペアで書く)
+
+確認コマンド=:
+(状況を安全に確認できる非破壊的なコマンド。最大${MAX_CONFIRM_COMMANDS}個。
+行頭に \"\$ \" を付ける)"
+    return
+  fi
+
+  if [ "$status" -eq 0 ]; then
+    printf "%b" "${CORE_RULE}
+
+[コマンド] $cmd
+[終了ステータス] $status
+[出力] $output
+[追加指示] ${USER_EXTRA_PROMPT}
+
+**回答形式 (各3行以内)**:
+
+解説=:
+(このコマンドの目的・何をしているか・出力の要点を3行以内で説明)
+
+コマンド候補=:
+(この結果を踏まえて実行が考えられる追加コマンドを提案。最大${MAX_SUGGESTION_COMMANDS}個。
+行頭に \"\$ \" を付けて、1行コメント → 1行コマンド のペアで書く)
+
+確認コマンド=:
+(状態確認や軽い調査のための非破壊的なコマンド。最大${MAX_CONFIRM_COMMANDS}個。
+行頭に \"\$ \" を付ける)"
+  else
+    printf "%b" "${CORE_RULE}
+
+[コマンド] $cmd
+[終了ステータス] $status
+[出力] $output
+[診断情報] ${extra_info:-なし}
+[追加指示] ${USER_EXTRA_PROMPT}
+
+**回答形式 (各3行以内)**:
+
+解説=:
+(このコマンドが何をしようとしたか、どのようなエラーで失敗したかを3行以内で説明)
+
+エラー原因(3行)=:
+1. (原因1)
+2. (原因2)
+3. (原因3)
+
+改善案(3行)=:
+1. (改善策1)
+2. (改善策2)
+3. (改善策3)
+
+コマンド候補=:
+(エラー解消や状況調査のために実行が考えられる候補コマンド。
+最大${MAX_SUGGESTION_COMMANDS}個。
+行頭に \"\$ \" を付けて、1行コメント → 1行コマンド のペアで書く)
+
+確認コマンド=:
+(原因を切り分けるための非破壊的な確認コマンド。最大${MAX_CONFIRM_COMMANDS}個。
+行頭に \"\$ \" を付ける)"
+  fi
+}
+
+# ============================================================
+# モデル選択
+# ============================================================
+if [ "$ANALYZE_STDIN_MODE" -eq 1 ]; then
+  # stdin 解説モードは必ず「標準 → ヘビー」
+  MODELS=("$DEFAULT_MODEL_CLOUD" "$DEFAULT_MODEL_HEAVY" "$FALLBACK_MODEL_HEAVY")
+else
+  if [ "$status" -eq 0 ]; then
+    MODELS=("$DEFAULT_MODEL_CLOUD" "$DEFAULT_MODEL_LIGHT" "$FALLBACK_MODEL_LIGHT")
+    if [ "$DETAIL_MODE" -eq 1 ]; then
+      MODELS=("$DEFAULT_MODEL_CLOUD" "$DEFAULT_MODEL_HEAVY" "$FALLBACK_MODEL_HEAVY")
+    fi
+  else
+    MODELS=("$DEFAULT_MODEL_CLOUD" "$DEFAULT_MODEL_HEAVY" "$FALLBACK_MODEL_HEAVY")
+  fi
+fi
+
+# ============================================================
+# LLM 実行
+# ============================================================
+prompt_content="$(create_prompt)"
+tmp_exp="$(mktemp)"
+SUCCESS=1
+MODEL_USED="FAILURE"
+
+for model_name in "${MODELS[@]}"; do
+  if [ -z "$model_name" ]; then
+    continue
+  fi
+
+  if printf "%s" "$prompt_content" | ollama run "$model_name" 2>/dev/null | \
+     grep -v "^Thinking\.\.\." | \
+     grep -v "^\.\.\.done thinking\." | \
+     grep -v "^We need to" | \
+     tee "$tmp_exp"; then
+    MODEL_USED="$model_name"
+    SUCCESS=0
+    break
+  else
+    rm -f "$tmp_exp"
+  fi
+done
+
+if [ "$SUCCESS" -ne 0 ]; then
+  touch "$tmp_exp"
+  MODEL_USED="FAILURE"
+fi
+
+exp="$(cat "$tmp_exp" 2>/dev/null || true)"
+rm -f "$tmp_exp"
+
+# LLM 出力長の制限
+if [ "${#exp}" -gt "$LLM_MAX_CHARS" ]; then
+  exp="${exp:0:$LLM_MAX_CHARS}
+...(省略)"
+fi
+
+# ============================================================
+# ログ保存
+# ============================================================
+{
+  echo "----- $(date '+%Y-%m-%d %H:%M:%S') -----"
+  echo "CMD: $cmd"
+  echo "STATUS: $status"
+  echo "ANALYZE_STDIN_MODE: $ANALYZE_STDIN_MODE"
+  echo "MODEL: $MODEL_USED"
+  echo "OUTPUT <<EOF"
+  printf '%s\n' "$output"
+  echo "EOF"
+  echo "EXPLANATION <<EOF"
+  printf '%s\n' "$exp"
+  echo "EOF"
+} >> "$LOG_FILE"
+
+exit "$status"
+

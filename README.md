@@ -1,211 +1,167 @@
 # olm
-- shell command helper
-- run command and explain output
-- analyze text from stdin
-- keep history as tsv
-- config via ~/.config/olm/config.env
 
-# install
-- ./setup.sh
-- source ~/.profile
-- olm --help
+シェルコマンドの実行・解析・履歴管理を行う CLI ツール。
+AI（ollama 等）はオプション。なくても RAG ベースで動作する。
+
+---
+
+## インストール
+
+```bash
+./setup.sh
+source ~/.profile
+olm --help
+```
+
+---
+
+## 使い方
+
+```bash
+# コマンドを実行して結果を解析
+olm "ls -la"
+
+# RAG ラッパーで実行（失敗時に過去の類似エラーを検索）
+olm -e "git status"
+
+# stdin のテキストを解析
+echo "some log text" | olm --analyze
+
+# 複数コマンドを順に実行
+printf "%s\n" "pwd" "ls -la" | olm --exec-stdin --yes
+
+# 履歴
+olm history --last 50
+
+# 設定
+olm config list
+olm config set OLM_LANG jp
+```
+
+---
+
+## ディレクトリ構成
+
+```
+olm/
+├── README.md
+├── DESIGN.md                   ← 設計書
+├── setup.sh
+├── bin/
+│   └── olm                     ← エントリポイント
+├── lib/
+│   ├── common.sh               ← 共通関数
+│   ├── cmd_analyze.sh          ← --analyze
+│   ├── cmd_exec.sh             ← コマンド実行
+│   ├── cmd_history.sh          ← history
+│   └── cmd_config.sh           ← config
+├── config/
+│   ├── config.env              ← デフォルト値
+│   └── config.schema.txt       ← キー一覧・説明
+├── lang/
+│   ├── en/
+│   │   ├── help.txt
+│   │   └── prompt.txt
+│   └── jp/
+│       ├── help.txt
+│       └── prompt.txt
+├── ai/
+│   ├── ollama.sh               ← ollama アダプター
+│   ├── openai.sh               ← 将来用
+│   └── none.sh                 ← AI なしフォールバック
+├── rag/
+│   ├── run.sh                  ← コマンドラッパー
+│   ├── store.sh                ← DB 操作
+│   ├── hint.sh                 ← コマンドヒント
+│   └── rag.db                  ← SQLite DB
+└── completion/
+    └── engine.sh               ← リアルタイム予測変換（実装中）
+```
 
-# config
-- if ~/.config/olm/config.env does not exist it will be created from config/config.env.example
-- key examples
-- OLM_MODEL_STD
-- OLM_MODEL_LGT
-- OLM_MODEL_HVY
-- OLM_MODEL_FA
-- OLM_MODEL_FB
-- OLM_LANG
-- OLM_ALWAYS_PROMPT
+---
 
-# usage
-- olm "ls -la"
-- olm -e "ls /nope"
-- echo "some log text" | olm --analyze
-- printf "%s\n" "pwd" "ls -la" | olm --exec-stdin --yes
-- olm config list
-- olm config set OLM_LANG jp
-- olm history --last 50
+## 設定
 
+ユーザー設定は `~/.config/olm/config.env` に書く。`setup.sh` が初回作成する。
 
-olm_rag_run.sh 使い方
-概要
+| キー | 説明 | デフォルト |
+|---|---|---|
+| `OLM_LANG` | 言語（en / jp） | `jp` |
+| `OLM_MODEL_STD` | 標準モデル | `phi3:3.8b-mini-4k-instruct-q4_k_m` |
+| `OLM_MODEL_LGT` | 軽量モデル | `phi3:3.8b-mini-4k-instruct-q4_k_m` |
+| `OLM_MODEL_HVY` | 重量モデル | `llama3:8b` |
+| `OLM_USE_RAG` | RAG 有効フラグ | `1` |
+| `OLM_AI_ADAPTER` | AI アダプター（ollama/openai/none） | `ollama` |
+| `OLM_ALWAYS_PROMPT` | 毎回追加するプロンプト | （空） |
 
-任意のコマンドを実行するラッパースクリプト
+全キーの説明は `config/config.schema.txt` を参照。
 
-実行結果を表示
+---
 
-失敗時にRAG検索
+## RAG
 
-設定によりログ保存
+失敗したコマンドと成功したコマンドを SQLite に蓄積し、類似エラーを検索する。
 
-設定によりLLM提案表示
+```bash
+# DB 初期化（初回のみ）
+rag/store.sh init
 
-基本構文
+# 手動でメモを登録
+rag/store.sh add "venv忘れ" "python,venv" "source .venv/bin/activate してから実行"
 
-./olm_rag_run.sh -- コマンド 引数
+# 検索
+rag/store.sh search "permission denied"
 
-例
+# RAG ラッパーで実行（失敗時に自動で検索・記録）
+rag/run.sh -- python train.py
+```
 
-./olm_rag_run.sh -- ssh gen
+### 環境変数（rag/run.sh）
 
-./olm_rag_run.sh -- ls -la
+| 変数 | 説明 | デフォルト |
+|---|---|---|
+| `AUTO_SAVE_FAILED` | 失敗を自動保存 | `1` |
+| `DO_RAG_SEARCH` | 失敗時に RAG 検索 | `1` |
+| `HINT_ENABLE` | 実行前ヒント表示 | `1` |
+| `HINT_INTERACTIVE` | ヒント選択 UI | `auto` |
+| `LLM_ENABLE` | RAG ヒットなし時に LLM 提案 | `0` |
 
-./olm_rag_run.sh -- git status
+---
 
-動作フロー
+## AI アダプター
 
-コマンド実行
+`OLM_AI_ADAPTER` で切り替え。ollama が起動していなくても `none` で動作する。
 
-終了コード取得
+```bash
+# ollama を使う（デフォルト）
+olm config set OLM_AI_ADAPTER ollama
 
-stdout / stderr 表示
+# AI を使わない
+olm config set OLM_AI_ADAPTER none
+```
 
-失敗時のみ以下実行
+---
 
-rag_save_failed.sh 実行（設定有効時）
+## リアルタイム予測変換（実装中）
 
-rag_search.sh 実行
+入力中のコマンドに対してリアルタイムで候補を表示する。
+詳細は `DESIGN.md` の `completion/` セクションを参照。
 
-LLM提案（設定有効時）
+---
 
-環境変数設定
+## トラブルシュート
 
-CMD_HINT_ENABLE
+**Permission denied**
+```bash
+chmod +x bin/olm rag/run.sh rag/store.sh rag/hint.sh
+```
 
-1: コマンドヒント有効
+**rag.db not found**
+```bash
+rag/store.sh init
+```
 
-0: 無効
-
-HINT_INTERACTIVE
-
-1: ヒント選択UI表示
-
-0: 非表示
-
-AUTO_APPLY_HINT
-
-1: ヒント自動適用
-
-0: 自動適用しない
-
-DO_RAG_SEARCH
-
-1: 失敗時にRAG検索
-
-0: 検索しない
-
-AUTO_SAVE_FAILED
-
-1: 失敗ログ保存
-
-0: 保存しない
-
-LLM_ENABLE
-
-1: RAGヒット無し時にLLM提案
-
-0: LLM使わない
-
-入力待ち無しテスト実行
-
-CMD_HINT_ENABLE=0 HINT_INTERACTIVE=0 AUTO_APPLY_HINT=0 LLM_ENABLE=0 ./olm_rag_run.sh -- ssh gen || true
-
-出力例
-
-CMD=ssh gen
-
-EXIT=255
-
-DUR_SEC=0
-
----- STDERR ----
-
-ssh: Could not resolve hostname gen: Name or service not known
-
----- RAG SEARCH ----
-
-QUERY_RAW=[ssh: Could not resolve hostname gen: Name or service not known]
-
-TOKENS=[ssh Could not resolve hostname gen Name or service not known]
-
-ディレクトリ構成
-
-olm_rag_run.sh
-
-rag_search.sh
-
-rag_save_failed.sh
-
-rag_save_ok.sh
-
-rag_init.sh
-
-rag.db
-
-rag_search.sh
-
-SQLite rag.db 使用
-
-FTS有無自動判定
-
-エラーメッセージからトークン生成
-
-類似エラー検索
-
-初期化
-
-rag.db が無い場合
-
-./rag_init.sh
-
-実行権限
-
-chmod +x olm_rag_run.sh
-
-chmod +x rag_search.sh
-
-安全設計
-
-LLMは自動実行しない
-
-コマンドは直接実行
-
-root操作は行わない
-
-破壊操作は提案のみ
-
-トラブルシュート
-
-Permission denied
-
-chmod +x 実行
-
-rag.db not found
-
-rag_init.sh 実行
-
-QUERY_RAW 表示崩れ
-
-CR除去処理実装済み
-
-拡張候補
-
-ベクトル検索追加
-
-LLMスコアリング
-
-自動修復モード
-
-必要なら
-
-上級者向け版
-
-安全設計仕様書
-
-アーキテクチャ設計書
-
-シーケンス図テキスト版
+**ollama に繋がらない**
+```bash
+olm config set OLM_AI_ADAPTER none
+```

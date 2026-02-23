@@ -118,7 +118,7 @@ cat "$tmp_out"; output="$(cat "$tmp_out")"; rm -f "$tmp_out"
 rag_save "$status" "$cmd" "$output"
 
 while true; do
-  echo -e "\n---- [olm] メニュー (Lang: $OLM_LANG) ----"
+  echo -e "\n---- [olm] メニュー (Lang: $OLM_LANG | Model: $DEFAULT_MODEL) ----"
   echo " [1] 要約 (何が起きたか)"
   echo " [2] 解説 (詳細な内容)"
   echo " [3] 対策 (次の確認コマンド)"

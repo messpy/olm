@@ -1,0 +1,25 @@
+# Local configuration
+config/config.env
+
+# RAG Database
+rag2/rag/rag.db
+rag2/rag/rag.db-shm
+rag2/rag/rag.db-wal
+
+# Logs
+rag2/logs/*.out
+rag2/logs/*.xtrace
+*.log
+
+# Temporary files
+out.txt
+err.txt
+*.tmp
+
+# Python
+__pycache__/
+*.py[cod]
+
+# OS specific
+.DS_Store
+Thumbs.db

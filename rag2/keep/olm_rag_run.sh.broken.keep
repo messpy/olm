@@ -1,0 +1,216 @@
+#!/usr/bin/env bash
+cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1
+
+DB="${RAG_DB:-./rag.db}"
+AUTO_SAVE_FAILED="${AUTO_SAVE_FAILED:-1}"
+DO_RAG_SEARCH="${DO_RAG_SEARCH:-1}"
+
+HINT_ENABLE="${HINT_ENABLE:-1}"
+AUTO_APPLY_HINT="${AUTO_APPLY_HINT:-0}"
+HINT_INTERACTIVE="${HINT_INTERACTIVE:-auto}"
+
+die(){ echo "ERROR: $*" >&2; exit 1; }
+
+command -v sqlite3 >/dev/null 2>&1 || die "sqlite3 not found"
+test -f "$DB" || die "DB not found: $DB (init DB first)"
+
+[ "${1:-}" = "--" ] || die "usage: $0 -- <command...>"
+shift
+[ $# -gt 0 ] || die "command required"
+
+orig_cmd="$*"
+
+# -------------------------
+# CMD HINT (pre-run) 安全版
+# -------------------------
+SUGGEST_KIND=""
+SUGGEST_QUERY=""
+REASON=""
+TAGS=""
+
+if [ "$HINT_ENABLE" = "1" ] && [ -x ./cmd_hint.sh ]; then
+  # KEY<TAB>VALUE を安全に読み取る（eval禁止）
+  while IFS=$'\t' read -r k v; do
+    case "$k" in
+      SUGGEST_KIND|SUGGEST_QUERY|REASON|TAGS)
+        printf -v "$k" '%s' "$v"
+        ;;
+    esac
+  done < <(./cmd_hint.sh "$@" 2>/dev/null || true)
+
+  if [ -n "$SUGGEST_KIND" ]; then
+    echo "---- CMD HINT ----"
+    echo "INPUT=[$orig_cmd]"
+    echo "SUGGEST_KIND=[$SUGGEST_KIND]"
+    echo "REASON=[$REASON]"
+    echo
+
+    if [ -x ./rag_search.sh ] && [ -n "$SUGGEST_QUERY" ]; then
+      echo "---- RAG SEARCH (by hint) ----"
+      ./rag_search.sh "$SUGGEST_QUERY" || true
+      echo
+    fi
+
+    if [ "$AUTO_APPLY_HINT" = "1" ]; then
+      case "$SUGGEST_KIND" in
+        ssh-keygen-ed25519-default)
+          set -- ssh-keygen -t ed25519
+          ;;
+      esac
+    else
+      do_interactive=0
+      if [ "$HINT_INTERACTIVE" = "1" ]; then
+        do_interactive=1
+      elif [ "$HINT_INTERACTIVE" = "auto" ]; then
+        [ -t 0 ] && [ -t 1 ] && do_interactive=1
+      fi
+
+      if [ "$do_interactive" = "1" ]; then
+        echo "Select: 1) run original  2) run suggested(kind)  3) only search (exit)"
+        printf "> "
+        read -r ans
+        case "$ans" in
+          2)
+            case "$SUGGEST_KIND" in
+              ssh-keygen-ed25519-default)
+                set -- ssh-keygen -t ed25519 -f "$HOME/.ssh/id_ed25519"
+                ;;
+            esac
+            ;;
+          3) exit 0 ;;
+          *) : ;;
+        esac
+        echo
+      fi
+    fi
+  fi
+fi
+
+cwd="$(pwd)"
+tmp_dir="${TMPDIR:-/tmp}/olm_rag.$$"
+mkdir -p "$tmp_dir" || die "cannot create temp dir"
+OUT="$tmp_dir/out.txt"
+ERR="$tmp_dir/err.txt"
+
+start="$(date +%s)"
+"$@" 1>"$OUT" 2>"$ERR"
+rc=$?
+end="$(date +%s)"
+dur=$((end-start))
+
+echo "CMD=$*"
+echo "EXIT=$rc"
+echo "DUR_SEC=$dur"
+echo
+echo "---- STDERR (tail 80) ----"
+tail -n 80 "$ERR" 2>/dev/null || true
+echo
+echo "---- STDOUT (tail 80) ----"
+tail -n 80 "$OUT" 2>/dev/null || true
+echo
+
+if [ "$rc" -ne 0 ]; then
+  if [ "$AUTO_SAVE_FAILED" = "1" ] && [ -x ./rag_save_failed.sh ]; then
+    ./rag_save_failed.sh --cmd "$*" --rc "$rc" --dur "$dur" --cwd "$cwd" --stderr "$ERR" --stdout "$OUT" >/dev/null || true
+  fi
+
+  if [ "$DO_RAG_SEARCH" = "1" ] && [ -x ./rag_search.sh ]; then
+  echo "---- RAG SEARCH ----"
+  q="$(tail -n 40 "$ERR" 2>/dev/null || true)"
+
+  rag_out=""
+  hits=0
+  if [ -n "$q" ]; then
+    rag_out="$(./rag_search.sh "$q" 2>&1)" || true
+    printf "%s\n" "$rag_out"
+    hits="$(printf "%s\n" "$rag_out" | awk -F" \| " '/^[0-9]+ \|/{c++} END{print c+0}')"
+  else
+    echo "SKIP: empty stderr"
+  fi
+
+  # RAGが0ヒットのときだけ LLMで“提案のみ”（実行はしない）
+  if [ "${LLM_ENABLE:-0}" = "1" ] && [ "${hits:-0}" -eq 0 ] && [ -x ./rag_llm.sh ]; then
+    echo
+    echo "---- LLM SUGGEST (no auto apply) ----"
+    prompt_base="$(cat <<'PROMPT'
+など破壊操作を提案しない
+- パッケージインストール（apt等）やroot前提操作を提案しない
+- 推測で断定しない。分からない場合は「確認コマンド」を出して切り分ける
+- コマンドは確認用途のみ（read-only）を最大3つまで
+- 出力はこの形式に固定
+
+【出力形式】
+[原因]
+- 1行
+
+[結論]
+- 1行
+
+[確認コマンド]
+- <cmd1>
+- <cmd2>
+- <cmd3>
+
+[対処]
+1. 1行
+2. 1行
+3. 1行
+PROMPT
+)"
+    prompt="$prompt_base
+
+入力:
+CMD: $*
+CWD: $cwd
+RC:  $rc
+STDERR:
+$(tail -n 80 "$ERR" 2>/dev/null || true)
+"
+    ./rag_llm.sh "$prompt" | sed -n '1,160p'
+  fi
+
+    fi
+
+    # RAGが空振りのときだけ LLMで“提案のみ”
+    if [ "${LLM_ENABLE:-0}" = "1" ] && [ "${hits:-0}" -eq 0 ]; then
+      echo
+      echo "---- LLM SUGGEST (no auto apply) ----"
+      prompt="など破壊操作を提案しない
+- パッケージインストール（apt等）やroot前提操作を提案しない
+- 推測で断定しない。分からない場合は「確認コマンド」を出して切り分ける
+- コマンドは確認用途のみ（read-only）を最大3つまで
+- 出力はこの形式に固定
+
+【出力形式】
+[原因]
+- 1行
+
+[結論]
+- 1行
+
+[確認コマンド]
+- <cmd1>
+- <cmd2>
+- <cmd3>
+
+[対処]
+1. 1行
+2. 1行
+3. 1行
+
+入力:
+CMD: $*
+CWD: $cwd
+RC:  $rc
+STDERR:
+$(tail -n 80 \"$ERR\" 2>/dev/null || true)
+"
+      ./rag_llm.sh "$prompt" | sed -n '1,160p'
+    fi
+    q="$(tail -n 40 "$ERR" 2>/dev/null || true)"
+    ./rag_search.sh "$q" || true
+  fi
+fi
+
+rm -rf "$tmp_dir" 2>/dev/null || true
+exit "$rc"
